@@ -79,4 +79,119 @@ class MinMaxStats(object):
         # init the root node
         root = Node(0)
         root.hidden_state = m.ht(observation)
+        if minmax:
+            root.to_play = observation[-1]
+        policy, value = m.ft(root.hidden_state)
+
+        # expand the children of the root node
+        for i in range(policy.shape[0]):
+            root.children[i] = Node(policy[i])
+            root.children[i].to_play = -root.to_play
         
+        # add exploration noise at the root
+            actions = list(root.children.keys())
+            noise = np.random.dirichlet([root_dirichlet_alpha] * len(actions))
+            frac = root_exploration_fraction
+            for a, n in zip(actions, noise):
+                root.children[a].prior = root.children[a].prior * (1 - frac) + n * frac
+
+        # run_mcts
+        #min_max_stats = MinMaxStats()
+        for _ in range(num_simulations):
+            history = []
+            node = root
+            search_path = [node]
+
+            # traverse down the tree according to the ucb_score 
+            while node.expanded():
+                #action, node = select_child(node, min_max_stats)
+                action, node = select_child(node)
+                history.append(action)
+                search_path.append(node)
+
+            # now we are at a leaf which is not "expanded", run the dynamics model
+            parent = search_path[-2]
+            node.reward, node.hidden_state = m.gt(parent.hidden_state, history[-1])
+
+            # use the model to estimate the policy and value, use policy as prior
+            policy, value = m.ft(node.hidden_state)
+            #print(history, value)
+
+            # create all the children of the newly expanded node
+            for i in range(policy.shape[0]):
+                node.children[i] = Node(prior=policy[i])
+                node.children[i].to_play = -node.to_play
+
+            # update the state with "backpropagate"
+            for bnode in reversed(search_path):
+                if minimax:
+                    bnode.value_sum += value if root.to_play == bnode.to_play else -value
+                else:
+                    bnode.value_sum += value
+                bnode.visit_count += 1
+                #min_max_stats.update(node.value())
+                value = bnode.reward + discount * value
+
+        # output the final policy
+        visit_counts = [(action, child.visit_count) for action, child in root.children.items()]
+        visit_counts = [x[1] for x in sorted(visit_counts)]
+        av = np.array(visit_counts).astype(np.float64)
+        policy = softmax(av)
+        return policy, root
+
+    def print_tree(x, hist=[]):
+        if x.visit_count != 0:
+            print("%3d %4d %-16s %8.4f %4d" % (x.to_play, x.visit_count, str(hist), x.value(), x.reward))
+        for i,c in x.children.items():
+            print_tree(c, hist+[i])
+
+    def get_action_space(K, n):
+        def to_one_hot(x,n):
+            ret = np.zeros([n])
+            ret[x] = 1.0
+            return ret
+        import itertools
+        aopts = list(itertools.product(list(range(n)), repeat=K))
+        aoptss = np.array([[to_one_hot(x, n) for x in aa] for aa in aopts])
+        aoptss = aoptss.swapaxes(0,1)
+        aoptss = [aoptss[x] for x in range(K)]
+        return aopts,aoptss
+
+    # TODO: this is naive search, replace with MCTS
+    aspace = {}
+    def naive_search(m, o_0, debug=False, T=1):
+        K,n = m.K, m.a_dim
+        if (K,n) not in aspace:
+            aspace[(K,n)] = get_action_space(K, n)
+        aopts,aoptss = aspace[(K,n)]
+
+        # concatenate the current state with every possible action
+        o_0s = np.repeat(np.array(o_0)[None], len(aopts), axis=0)
+        ret = m.mu.predict([o_0s]+aoptss)
+        v_s = ret[-3]
+        
+        minimum = min(v_s)
+        maximum = max(v_s)
+        v_s = (v_s - minimum) / (maximum - minimum)
+        
+        # group the value with the action rollout that caused it
+        v = [(v_s[i][0], aopts[i]) for i in range(len(v_s))]
+        if debug:
+            print(sorted(v, reverse=True))
+        
+        av = [0] * n
+        for vk, ak in v:
+            av[ak[0]] += vk
+
+        av = np.array(av).astype(np.float64) / T
+        policy = softmax(av)
+        return policy
+
+    def get_values(m, o_0):
+        hidden_state = m.ht(o_0)
+        vs = []
+        for n in range(m.a_dim):
+            _, ht2 = m.gt(hidden_state, n)
+            _, v = m.ft(ht2)
+            vs.append(v)
+        return vs
